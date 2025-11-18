@@ -1,0 +1,330 @@
+---
+title: "Classification of cell status with machine learning methods"
+author: "Guojun Ma"
+output:
+  html_document:
+    keep_md: yes
+bibliography: references.bib
+---
+
+# Introduction
+
+## What is gene expression?
+
+Gene expression is the process by which the information encoded in a gene’s DNA sequence is converted into a functional product—most commonly a protein, but also non‐coding RNA molecules. The expression of a gene refers to the quantity of its mRNA detected in a cell, where a higher level of gene expression indicates a greater abundance of mRNA present. Gene expression is often thinks of a lightbulb - it measures the activity of a cell; The activity of gene expression on many factors, it can depends on the cell-type - which is one of the main factor that differentiate cells. But it can also depends on the environmental factors - as epigenetic can turns on and off the gene expression level. Overall, It constitutes the fundamental link between genotype and phenotype.
+
+In this project, we analyze a dataset from the paper by [Smeets et al. 2010](http://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE23177), who examined gene expression profiles in primary breast tumours. The authors aimed to determine whether tumours that had spread to the lymph nodes (LN-positive, generally bad) exhibited different gene expression profiles compared to LN-negative. Also, how can the gene expression profile be utilized to predict whether tumours have sprea to lymph nodes?
+
+## Data Preparation
+
+```{r, message=FALSE}
+library(tidyverse) #Data wrangling and visualization
+library(limma)
+library(CMA) #run and compare classification algorithms 
+library(ggplot2)
+library(ROCR)
+library(GEOquery) #Query the data 
+```
+
+First, let's retrieve our dataset from GEO with `getGEO` from `GEOquery` package. The access number is GSE23177, and the detail of dataset is published on the [website](comes%20from%20a%20paper%20by%20Smeets%20et%20al.%202010).
+
+```{r fetchGEO, message = FALSE}
+# Returns a list of expressionsets
+datgeo <- getGEO('GSE23177', GSEMatrix = TRUE, AnnotGPL = TRUE) 
+(dat <- datgeo[[1]])
+```
+
+The dataset contains 24236 genes(features) from 116 samples.
+
+```{r}
+table(dat$`ln:ch1`)
+```
+
+The status of the lymph node is known for each sample, with 57 LN negative and 59 LN positive.
+
+The expression matrix contains the sample IDs and their corresponding gene expression profiles, which we can access from the `ExpressionSet` object with `exprs()`. Essentially, each column is a different sample(a tissue, under treatment, environment, etc) and each row is a gene(or a probe).
+
+```{r}
+#Print out the small subset of the expression matrix
+exprs(dat)[1:10, 1:5]
+```
+
+The properties associated with each sample are stored in the sample metadata, which can be accessed using the `pData()` function. Now we'll do some data wrangling to pull out the metadata variables we are interested in, and recode some of them.
+
+```{r wrangle}
+# extract only those variables of interest 
+pData(dat) <- pData(dat) %>%
+  rename(sample_id = geo_accession,
+         LnStatus = characteristics_ch1.2, #disease status
+         LnRatio = characteristics_ch1.3, #the proportion of the infected node
+         Set = characteristics_ch1) %>% #Which are training and testing set 
+  mutate(LnStatus = factor(gsub("ln: ", "", LnStatus))) %>%
+  mutate(LnRatio = as.numeric(gsub("lnratio: ", "", LnRatio))) %>%
+  mutate(Set = ifelse(Set == "patient type: training set", "training", "test"))
+
+str(pData(dat) %>% select(sample_id, LnStatus, LnRatio, Set) )
+```
+
+Next, let's split the `ExpressionSet` object into two different parts - one for the training and one for the test set.
+
+```{r split}
+# split the ExpressionSet into training and test sets. 
+table(pData(dat)$Set)
+train.es <- dat[, pData(dat)$Set == "training"]
+test.es <- dat[ , pData(dat)$Set == "test"]
+```
+
+We see that 20 were used as test samples and 96 used as training samples.
+
+```{r eda}
+#Look at the number of case/control
+table(train.es$LnStatus)
+table(test.es$LnStatus)
+
+# understand the continuous response
+summary(pData(train.es)$LnRatio)
+summary(pData(test.es)$LnRatio)
+```
+
+The case/control ratio in the training and test sets is equal. Now, we can do some exploratory analysis of the data before trying some classification methods.
+
+## Data exploration
+
+```{r missing}
+sum(is.na(exprs(train.es)))
+sum(is.na(exprs(test.es)))
+```
+
+We don't find any missing value in the gene expression matrix.
+
+```{r plot, warning=FALSE}
+# function to create tidy data table of expression and metadata
+toLonger <- function(expset) {
+    stopifnot(class(expset) == "ExpressionSet")
+    
+    expressionMatrix <- longExpressionMatrix <- exprs(expset) %>% 
+      as.data.frame() %>%
+      rownames_to_column("gene") %>%
+      pivot_longer(cols = !gene, 
+                   values_to = "expression",
+                   names_to = "sample_id") %>%
+      left_join(pData(expset), by = "sample_id")
+  return(expressionMatrix)
+}
+
+toLonger(dat[rangenes,]) %>%
+  ggplot(aes(y = expression, x = LnStatus)) +
+    facet_wrap(Set ~ gene) +
+    geom_jitter(width = 0.2, alpha = 0.5)
+```
+
+It is difficult to tell which genes are differentially expressed between the conditions, based on the plot alone. One of the methods to perform differential expression (DE) analysis, a formal statistical technique.
+
+# Differential expression(DE) analysis
+
+The aim of DE analysis is to detect genes that are expressed with significant differences across different conditions. One of the commonly used approaches for this task is to employ linear regression, which assesses one gene at a time to obtain its p-value. After that, the genes that pass the significant threshold are selected. However, since the number of genes can be in tens of thousands, it is essential to control for the false positives. A common way to achieve this is by using the Bonferroni correction to the p-value.
+
+However, there is a problem with this approach - the gene expression data is usually high dimensional, which means the number of measurements is large compared to the sample size. Basically, this problem can lead to an inflate in t-statistics and many false positives. The `Limma` package specially solves this problem by adjusting the t-statistics using the empirical Bayes approach.
+
+```{r}
+designMatrix <- model.matrix(~LnStatus, data = pData(dat))
+LMmodel <- limma::lmFit(exprs(dat), designMatrix)
+LMmodelEb <- eBayes(LMmodel)
+```
+
+The top $10$ most statistically significant genes are the following:
+
+```{r}
+topTable(LMmodelEb)
+```
+
+The `P.value` shows the significance level before p-value correction. The `adj.P.val` shows the corrected p-value. The correct p-value indicates that these genes are not differentially expressed between Ln-positive and Ln-negative cells.
+
+# Fitting the Classification model
+
+In the previous study by [Smeets et al. 2010](http://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE23177) , the researchers utilized a support vector machine to classify LN-positive and LN-negative tumours, based on the gene expression data. They assessed the outcomes using the ROC curve, which achieved an area under the ROC curve (AUC) of 0.66 on the training data set and 0.65 on the test set. While these results surpass random chance, they do not predict the (Random chance would yield an AUC of 0.5, while perfect classification would result in an AUC of 1.0).
+
+In this project, we aim to apply multiple classification algorithms for this task and see if we can find any improvement. We use cross-validation to find the best classification algorithm to predict the outcome. We also use cross-validation to perform hyperparameter tuning for classification algorithms.
+
+## Model selection
+
+we make the six-fold cross-validation split, and make sure each fold contains a equal number of Ln-positive and Ln-negative cases.
+
+```{r split, results='hide', message=FALSE}
+#First Split the training set to perform cross-validation. By setting the argument strat = True, we ensure that each fold contains the same number of case and control samples. 
+set.seed(123)
+splits <- CMA::GenerateLearningsets(y = train.es$LnStatus, method="CV", fold=6, strat= TRUE)
+```
+
+Due to the large number of predictors (approximately 25000 genes) relative to the sample size, variable selection is often necessary before applying classification algorithms. This scenario is an example of high-dimensional statistical problems, which have been the focus of significant research efforts over the past decade. Here, we select variables using the Limma method used in DE analysis- the genes are ranked according to the association level with the outcome.
+
+```{r geneslection, message=FALSE}
+#Rank the genes in term of importance by p-value using the Limma method
+rankgenes <- CMA::GeneSelection(X=t(exprs(train.es)), y=train.es$LnStatus, learningsets=splits, method="limma")
+show(Topgenes)
+
+#aggregate the results across the 6 splits
+seliter<-numeric()
+for(i in 1:6) seliter<-c(seliter, toplist(rankgenes, iter=i, top = 10, show=FALSE)$index)
+
+# Choose the 20 probes which are chosen most commonly in the 6 splits
+bestprobes<-as.numeric(names(sort(table(seliter), dec=T)))[1:20]
+
+# examine the feature data for the best probes
+fData(dat)[bestprobes, c("ID", "Gene symbol", "Gene title", "Chromosome location")]
+
+
+```
+
+In this project, we compare the following classification methods:
+
+-   K-Nearest-Neighborhood(KNN).
+
+-   Fisher's Linear Discriminant Analysis(LDA).
+
+-   Quadratic Disrciminant Analysis.(QDA)
+
+-   Support Vector Machine(SVM) with linear kernel
+
+-   Elastic net.
+
+-   Random Forest.
+
+-   Feed-Forward Neural Networks.
+
+-   Probabilistic nearest neighbour.
+
+First, we perform hyperparameter tuning for each model, except LDA and random forest. Then, we fit different models to each cross-validation set to evaluate the testing errors.
+
+```{r tune, results='hide', cache=TRUE}
+tunesvm <- tune(X = t(exprs(train.es)), y = train.es$LnStatus, learningsets= splits, genesel = rankgenes, nbgene = 50, classifier = svmCMA)
+
+tuneknn <- tune(X = t(exprs(train.es)), y = train.es$LnStatus, learningsets= splits, genesel = rankgenes, nbgene = 50, classifier = knnCMA)
+
+tuneEN <- tune(X = t(exprs(train.es)), y = train.es$LnStatus, learningsets= splits, genesel = rankgenes, nbgene = 50, classifier = ElasticNetCMA)
+
+
+tuneFNN <- tune(X = t(exprs(train.es)), y = train.es$LnStatus, learningsets= splits, genesel = rankgenes, nbgene = 50, classifier = nnetCMA)
+ 
+tunePKNN <- tune(X = t(exprs(train.es)), y = train.es$LnStatus, learningsets= splits, genesel = rankgenes, nbgene = 50, classifier = pknnCMA)
+
+```
+
+```{r classification, cache = TRUE, cache=TRUE}
+set.seed(123)
+n <- 50 #Number of importance genes select by Limma used as features. 
+
+# Fitting the SVM model 
+pr_SVM <- classification(X = t(exprs(train.es)), y = train.es$LnStatus, learningsets = splits,
+genesel = rankgenes, nbgene = n, classifier = svmCMA, tuneres = tunesvm)
+
+#KNN
+pr_KNN <- classification(X = t(exprs(train.es)), y = train.es$LnStatus, learningsets = splits,
+genesel = rankgenes, nbgene = n, classifier = knnCMA, tuneres = tuneknn)
+
+# LDA
+pr_LDA <- classification(X = t(exprs(train.es)), y = train.es$LnStatus, learningsets = splits,
+genesel = rankgenes, nbgene = n, classifier = ldaCMA)
+
+# Elastic Net
+pr_EN <- classification(X = t(exprs(train.es)), y = train.es$LnStatus, learningsets = splits,
+genesel = rankgenes, nbgene = n, classifier = ElasticNetCMA, tuneres = tuneEN)
+
+#Random forest
+pr_RF <- classification(X = t(exprs(train.es)), y = train.es$LnStatus, learningsets = splits,
+genesel = rankgenes, nbgene = n, classifier = rfCMA)
+
+#Feed-Forward Neural Networks
+pr_FNN <- classification(X = t(exprs(train.es)), y = train.es$LnStatus, learningsets = splits,
+genesel = rankgenes, nbgene = n, classifier = nnetCMA, tuneres = tuneFNN)
+
+#Probabilistic nearest neighbours
+pr_PKNN <- classification(X = t(exprs(train.es)), y = train.es$LnStatus, learningsets = splits,
+genesel = rankgenes, nbgene = n, classifier = pknnCMA, tuneres = tunePKNN)
+
+```
+
+Let us make a comparison using multiple metrics:
+
+-   Misclassification: The proportion of data that is labelled incorrectly.
+
+-   Sensitivity (Recall): the proportion of actual positives correctly identified by the model. It is defined as the number of true positives(TP) divided by the total number of actual positives (True positives + false negatives).
+
+-   Specificity (precision): the proportion of actual negatives which are correctly identified. It is defined as the number of True negatives(TN) divided by the number of actual negatives (TN + False positives).
+
+-   AUC: The area under the ROC(Receiver Operating Characteristic) curve. A ROC curve plots the true positive rate (sensitivity) against the false positive rate (1 - specificity) at different decision thresholds. An AUC value closer to 1 indicates a better model performance.
+
+Misclassification can be a misleading metric in the case of an unbalanced case/control. Suppose in the extreme case there are a rare disease that occurs only 1 in million. An algorithm can have a low misclassification rate- by simply predicting all patients as healthy. However, this is not a useful algorithm at all. In medical contexts, the concepts of sensitivity and precision are more commonly used. Sensitivity and precision have an inverse relationship; as one increases, the other tends to decrease.
+
+In medical contexts, it is crucial to prioritize either high sensitivity or high specificity when selecting a model. For instance, in cancer diagnostics, achieving high sensitivity is crucial because misdiagnosing individuals with cancer can miss the opportunity for timely treatment; also, achieving high specificity is even more important because mistreating someone healthy is bad.
+
+Let us now compare the model's performance using these metrics.
+
+```{r compare, message=FALSE}
+pr <- list(pr_SVM, pr_KNN, pr_LDA, pr_EN, pr_RF, pr_FNN, pr_PKNN)
+comparison <- compare(pr, plot = TRUE, measure = c("misclassification", "sensitivity", "specificity"))
+print(comparison)
+```
+
+We see that random forest achieves the lowest misclassification rate. In particular, Random forest has the highest sensitivity (it correctly identify 75% of the
+
+```{r, message=FALSE, warning=FALSE}
+#Compare the auc metric
+pr2 <- list(pr_RF, pr_EN, pr_LDA, pr_FNN)
+comparison2 <- compare(pr2, plot = TRUE,  measure = c("auc"))
+print(comparison2)
+```
+
+It looks like that the
+
+random forest method has the highest AUC. Based on all metrics, we conclude that random forest is the best classification model for this data set. Note this AUC is the same as what the authors achieved in their training set. Let us now evaluate it on the test set and see if there is any improvement.
+
+## Testing the selected model
+
+Now that we decided on which method we are going to use to classify samples in the test set, we need to train the model using the full training set and then classify samples of the test set.
+
+```{r, message=FALSE}
+#Selecting the top 50 significant genes selected by the package Limma
+inx <- rownames(topTable(LMmodelEb, number = 50))
+train_exprsmat <- exprs(train.es)[inx,]
+test_exprsmat <- exprs(test.es)[inx,]
+```
+
+```{r test, message=FALSE}
+#Fitting the model
+set.seed(344)
+RF <- randomForest(x = t(train_exprsmat), y = train.es$LnStatus, xtest = t(test_exprsmat), ytest = test.es$LnStatus)
+
+#Store the prediction value
+yhat.RF <- RF$test$predicted
+
+#Calculate the misclassification rate
+pr.errTest<- mean(test.es$LnStatus != yhat.RF)
+pr.errTest
+```
+
+This is comparable to the misclassification rate obtained by the cross-validation(0.368).
+
+```{r,message=FALSE}
+#Calculate the sensitivity and Specificity
+sensitivity <- sum(yhat.RF[test.es$LnStatus == "pos"] == "pos")/ sum(test.es$LnStatus == "pos") 
+specificity <- sum(yhat.RF[test.es$LnStatus == "neg"] == "neg")/ sum(test.es$LnStatus == "neg")
+print(sensitivity); print(specificity)
+```
+
+```{r, message=FALSE}
+#Plot the ROC curve and compute the AUC
+roc_obj <- roc(test.es$LnStatus,  RF$test$votes[,2] )
+plot(roc_obj,main = "ROC curve of random forest classification")
+auc(roc_obj)
+```
+
+The ROC plot illustrates that most data points are positioned above the diagonal line, which indicates a higher proportion of true positives compared to false positives. The Area Under the Curve (AUC) metric quantifies the overall performance of the model by calculating the area under the ROC curve. The AUC value is calculated to be 0.717, which is higher than what was achieved during cross-validation and what the authors achieved in their publication.
+
+# Conclusion
+
+We initiated our analysis by conducting inference on the data set to identify genes significantly associated with disease status. Subsequently, we utilized these genes to predict the disease status of test samples by leveraging the top 50 gene expressions. Our study involved the comparison of various machine learning methods through cross-validation, revealing that the random forest algorithm exhibited superior performance across all metrics (mis-classification rate of 0.368, sensitivity of 0.656, specificity of 0.608).
+
+Further evaluation of the random forest model on the test set yielded an AUC value of 0.717, demonstrating a slight enhancement in performance compared to existing literature. However, in the context of cancer diagnostics, sensitivity emerges as a critical metric. With a sensitivity of 0.656, our model wrongly diagnoses an average of 34 out of 100 true cancer patients. This is not good enough to be of clinical relevance.
+
+Considering the prevalence of lymph-node-positive breast cancer, which is approximately 33% during diagnosis (according to [<http://seer.cancer.gov/statfacts/html/breast.html>]), it is crucial to build a model with high sensitivity (close to 1). Given that both our best model and the authors' model achieve similar performance, it is likely that additional data, such as patient information, is essential to enhance prediction accuracy and clinical utility.

@@ -1,0 +1,569 @@
+Explore 1000 genomics data using unsupervised learning methods
+================
+
+# Introduction
+
+The 1000 Genomes Project is a landmark international collaboration that
+produced the most comprehensive public catalogue of human genetic
+variation to date. It contains the genome sequencing of 2,504
+individuals from 26 diverse populations around the world. All data are
+freely available on the official website, providing an essential
+baseline for studies of population genetics, disease‐association
+mapping, and functional genomics. In this project, we explore the
+genetic dataset using unsupervising learning methods.
+
+## Load data and packages
+
+### Install & load required libraries
+
+The following code chunk will load required libraries. If you don’t
+already have these installed, you’ll first need to install them
+(recommended way is to use `BiocManager::install("packageName")`).
+
+``` r
+if (!requireNamespace("BiocManager", quietly=TRUE))
+    install.packages("BiocManager")
+BiocManager::install("gdsfmt")
+BiocManager::install("SNPRelate")
+```
+
+``` r
+library(gdsfmt) # provides the genomic data structure (GDS) file format for array-oriented bioinformatic data, which is a container for storing annotation data and SNP genotypes
+library(SNPRelate) #Read SNP data and perform PCA
+```
+
+    ## SNPRelate -- supported by Streaming SIMD Extensions 2 (SSE2)
+
+``` r
+library(ggplot2) 
+library(dplyr)
+```
+
+    ## 
+    ## Attaching package: 'dplyr'
+
+    ## The following objects are masked from 'package:stats':
+    ## 
+    ##     filter, lag
+
+    ## The following objects are masked from 'package:base':
+    ## 
+    ##     intersect, setdiff, setequal, union
+
+``` r
+library(kableExtra) 
+```
+
+    ## 
+    ## Attaching package: 'kableExtra'
+
+    ## The following object is masked from 'package:dplyr':
+    ## 
+    ##     group_rows
+
+``` r
+library(Rtsne) #t-SNE
+library(pheatmap)
+library(cluster)
+theme_set(theme_bw()) # prettier ggplot plots 
+```
+
+### Download and read the data into R
+
+I obtained the genetic data from 1000 genomic, followed the tutorial
+posted here (<https://www.biostars.org/p/335605/>). LD-pruning was
+performed using the PLINK software. SNPs with MAF \< 0.1 were removed.
+After filtering, the data contain 451,115 SNPs from 2,504 samples.
+
+``` r
+# Convert the plink format to GDS format used for the package. 
+snpgdsBED2GDS(bed.fn = "data/1000genomicMerge.bed",
+              bim.fn = "data/1000genomicMerge.bim",
+              fam.fn = "data/1000genomicMerge.fam",
+              out.gdsfn = "data/1000genomic.gds")
+```
+
+``` r
+genofile <- snpgdsOpen("data/1000genomic.gds") #read the genotype file 
+genofile
+```
+
+    ## File: C:\Users\gordo\Documents\GitHub\Bioinformatics\Explore 1000 genomics data using unsupervised learning methods\data\1000genomic.gds (272.6M)
+    ## +    [  ] *
+    ## |--+ sample.id   { Str8 2504 LZMA_ra(7.66%), 1.5K }
+    ## |--+ snp.id   { Str8 451155 LZMA_ra(26.7%), 1.9M }
+    ## |--+ snp.position   { Int32 451155 LZMA_ra(54.2%), 954.4K }
+    ## |--+ snp.chromosome   { UInt8 451155 LZMA_ra(0.07%), 301B } *
+    ## |--+ snp.allele   { Str8 451155 LZMA_ra(20.7%), 446.9K }
+    ## |--+ genotype   { Bit2 2504x451155, 269.3M } *
+    ## \--+ sample.annot   [ data.frame ] *
+    ##    |--+ sex   { Str8 2504 LZMA_ra(3.91%), 105B }
+    ##    \--+ phenotype   { Int32 2504 LZMA_ra(1.26%), 133B }
+
+``` r
+PED <- read.table('data/20130606_g1k.ped', header = TRUE, skip = 0, sep = '\t') #Read in the population information file 
+
+geno <- snpgdsGetGeno(genofile, snpfirstdim = FALSE, with.id = TRUE)
+```
+
+    ## Genotype matrix: 2504 samples X 451155 SNPs
+
+``` r
+tab <- data.frame(sample.id = geno$sample.id)
+tab <- left_join(tab, PED, by = c("sample.id" = "Individual.ID"))
+# Assigning the superpopulation group by browsering information from: http://www.internationalgenome.org/category/population/
+tab <- tab %>%
+  mutate(superpop = case_when(
+    Population %in% c("ESN", "MSL", "YRI", "LWK", "GWD") ~ "African",
+    Population %in% c("ASW", "ACB", "MXL", "PUR", "CLM", "PEL") ~ "Latin American",
+    Population %in% c("CEU", "TSI", "GBR", "FIN", "IBS") ~ "European",
+    Population %in% c("CHB", "JPT", "CHS", "CDX", "KHV", "CHD") ~ "East Asian", 
+    Population %in% c("GIH", "PJL", "BEB", "STU", "ITU") ~ "South Asian"))  %>%
+  mutate(superpop = as.factor(superpop))
+table(tab$superpop) 
+```
+
+    ## 
+    ##        African     East Asian       European Latin American    South Asian 
+    ##            504            504            503            504            489
+
+``` r
+geno$superpop <- tab$superpop
+geno$population <- tab$Population
+```
+
+The table lists the number of each population, where the detailed
+description can be found on the
+[website]((http://www.internationalgenome.org/category/population/)).
+
+# Dimension reduction
+
+## PCA
+
+The common way to explore high-dimensional data is by using principal
+component analysis(PCA). PCA is a dimensional reduction technique which
+preserves the dimensions with the largest variance in the data. It is a
+useful initial means of finding hidden structures in the data, and also
+to determine the important sources of variance.
+
+``` r
+pca <- snpgdsPCA(genofile, num.thread=8) #Perform the principal component analysis
+```
+
+    ## Principal Component Analysis (PCA) on genotypes:
+    ## Excluding 0 SNP on non-autosomes
+    ## Excluding 0 SNP (monomorphic: TRUE, MAF: NaN, missing rate: NaN)
+    ##     # of samples: 2,504
+    ##     # of SNPs: 451,155
+    ##     using 8 threads
+    ##     # of principal components: 32
+    ## PCA:    the sum of all selected genotypes (0,1,2) = 478640888
+    ## CPU capabilities: Double-Precision SSE2
+    ## Tue May 13 16:30:05 2025    (internal increment: 808)
+    ## [..................................................]  0%, ETC: ---        [==================================================] 100%, completed, 1.1m
+    ## Tue May 13 16:31:08 2025    Begin (eigenvalues and eigenvectors)
+    ## Tue May 13 16:31:12 2025    Done.
+
+``` r
+plot(pca$varprop[1:10], xlab = "Principal componets", ylab = "percentage of variance explained")
+```
+
+![](clustering-pca_files/figure-gfm/unnamed-chunk-8-1.png)<!-- -->
+
+The plot shows the percentage of variance explained by the top 10
+principal components. Here we see the first 4 components almost explain
+all the genetic variance.
+
+``` r
+tab <- data.frame(sample.id = pca$sample.id,
+    EV1 = pca$eigenvect[,1],    # the first eigenvector
+    EV2 = pca$eigenvect[,2],    # the second eigenvector
+    EV3 = pca$eigenvect[,3], 
+    EV4 = pca$eigenvect[,4], 
+    stringsAsFactors = FALSE)
+tab <- left_join(tab,PED, by = c("sample.id" = "Individual.ID"))
+
+# Assigning the superpopulation group by browsering information from: http://www.internationalgenome.org/category/population/
+tab <- tab %>%
+  mutate(superpop = case_when(
+    Population %in% c("ESN", "MSL", "YRI", "LWK", "GWD") ~ "African",
+    Population %in% c("ASW", "ACB", "MXL", "PUR", "CLM", "PEL") ~ "Latin American",
+    Population %in% c("CEU", "TSI", "GBR", "FIN", "IBS") ~ "European",
+    Population %in% c("CHB", "JPT", "CHS", "CDX", "KHV", "CHD") ~ "East Asian", 
+    Population %in% c("GIH", "PJL", "BEB", "STU", "ITU") ~ "South Asian"))  %>%
+  mutate(superpop = as.factor(superpop))
+```
+
+``` r
+# Draw
+plot(tab$EV1, tab$EV2, col=as.integer(tab$superpop), xlab="First component", ylab="Second component" )
+legend("topleft", legend=levels(tab$superpop), pch="o", col=1:nlevels(tab$superpop), cex = 0.7)
+```
+
+![](clustering-pca_files/figure-gfm/unnamed-chunk-10-1.png)<!-- -->
+
+``` r
+plot(tab$EV1, tab$EV3, col=as.integer(tab$superpop), xlab="First component", ylab="Third component" )
+legend("topleft", legend=levels(tab$superpop), pch="o", col=1:nlevels(tab$superpop), cex = 0.7)
+```
+
+![](clustering-pca_files/figure-gfm/unnamed-chunk-10-2.png)<!-- -->
+
+``` r
+lbls <- paste("PC", 1:4, "\n", format(pca$varprop[1:4] * 100, digits=2), "%", sep="")
+pairs(pca$eigenvect[,1:4], col=tab$superpop, labels=lbls)
+```
+
+![](clustering-pca_files/figure-gfm/unnamed-chunk-10-3.png)<!-- -->
+
+We observe that the superpopulations are mostly clustered in groups when
+visualizing the first and the third principal components. We also
+observe that there is a wider spread of the first component among Latin
+Americans. Some are more similar to European, while some are closer to
+African. This can be attributed to greater genetic diversity among Latin
+Americans due to historical migration and population mixing.
+
+``` r
+tab_Latin <- subset(tab, superpop == "Latin American") %>%
+  mutate(Population = as.factor(Population))
+
+plot(tab_Latin$EV1, tab_Latin$EV2, col=as.integer(tab_Latin$Population), xlab="First component", ylab="Second component")
+legend("bottomleft", legend=levels(tab_Latin$Population), pch="o", col=1:nlevels(tab_Latin$Population), cex = 0.7)
+```
+
+![](clustering-pca_files/figure-gfm/unnamed-chunk-11-1.png)<!-- -->
+
+Given that ASW are of African Ancestry in the Southwest US and ACB are
+of African Caribbean in Barbados, it is unsurprising to see the overlaps
+with African superpopulation from the PCA plot. We also found some
+overlaps between PUR(Puerto Rican), CLM(Colombina) and European
+superpopulation.
+
+``` r
+tab_EUR <- subset(tab, superpop == "European") %>%
+  mutate(Population = as.factor(Population))
+
+plot(tab_EUR$EV1, tab_EUR$EV2, col=as.integer(tab_EUR$Population), xlab="First component", ylab="Second component")
+legend("topleft", legend=levels(tab_EUR$Population), pch="o", col=1:nlevels(tab_EUR$Population), cex = 0.7)
+```
+
+![](clustering-pca_files/figure-gfm/unnamed-chunk-12-1.png)<!-- -->
+
+In the European population, the first component reflects geography
+across Europe, arranged from south to north. The Iberian populations in
+Spain (IBS) exhibit the smallest first component, followed by the
+Tuscans in Italy (TSI), the British in England and Scotland (GBR), the
+residents of Utah with Northern and Western European ancestry (CEU), and
+the Finnish people (FIN) in Finland. This replicates earlier results
+reported by (Novembre et al. 2008), which displayed a similar pattern.
+
+## t-SNE
+
+Another method that is an alternative to PCA is t-SNE. In contrast to
+PCA, it accounts for non-linear interactions between the features.
+
+``` r
+tSNE <- Rtsne(geno$genotype,verbose = TRUE,partial_pca = TRUE) 
+```
+
+    ## Performing PCA
+    ## Read the 2504 x 50 data matrix successfully!
+    ## OpenMP is working. 1 threads.
+    ## Using no_dims = 2, perplexity = 30.000000, and theta = 0.500000
+    ## Computing input similarities...
+    ## Building tree...
+    ## Done in 0.34 seconds (sparsity = 0.045037)!
+    ## Learning embedding...
+    ## Iteration 50: error is 74.108297 (50 iterations in 0.18 seconds)
+    ## Iteration 100: error is 59.936121 (50 iterations in 0.15 seconds)
+    ## Iteration 150: error is 57.645354 (50 iterations in 0.15 seconds)
+    ## Iteration 200: error is 56.622764 (50 iterations in 0.14 seconds)
+    ## Iteration 250: error is 55.959865 (50 iterations in 0.15 seconds)
+    ## Iteration 300: error is 1.344077 (50 iterations in 0.14 seconds)
+    ## Iteration 350: error is 1.043354 (50 iterations in 0.14 seconds)
+    ## Iteration 400: error is 0.897769 (50 iterations in 0.14 seconds)
+    ## Iteration 450: error is 0.820682 (50 iterations in 0.14 seconds)
+    ## Iteration 500: error is 0.780396 (50 iterations in 0.14 seconds)
+    ## Iteration 550: error is 0.757609 (50 iterations in 0.14 seconds)
+    ## Iteration 600: error is 0.743914 (50 iterations in 0.14 seconds)
+    ## Iteration 650: error is 0.733261 (50 iterations in 0.14 seconds)
+    ## Iteration 700: error is 0.724749 (50 iterations in 0.14 seconds)
+    ## Iteration 750: error is 0.718748 (50 iterations in 0.14 seconds)
+    ## Iteration 800: error is 0.713221 (50 iterations in 0.14 seconds)
+    ## Iteration 850: error is 0.706759 (50 iterations in 0.14 seconds)
+    ## Iteration 900: error is 0.702079 (50 iterations in 0.14 seconds)
+    ## Iteration 950: error is 0.696156 (50 iterations in 0.14 seconds)
+    ## Iteration 1000: error is 0.694277 (50 iterations in 0.14 seconds)
+    ## Fitting performed in 2.85 seconds.
+
+``` r
+as.data.frame(tSNE$Y) %>% 
+  mutate(population = geno$population) %>% 
+  mutate(superpop = geno$superpop) %>%
+  ggplot(aes(x = V1, y = V2, colour = superpop)) + 
+    geom_point() + 
+    xlab("tsne 1") +
+    ylab("tsne 2") +
+    ggtitle("tSNE")
+```
+
+![](clustering-pca_files/figure-gfm/unnamed-chunk-14-1.png)<!-- -->
+
+It does not really separate the superpopulation into clusters. It is not
+actually perform better than PCA.
+
+# Clustering
+
+## Hierarchical Clustering
+
+Perform clustering based on the top 10 principal components of genetic
+matrix.
+
+``` r
+distance <- dist(pca$eigenvect[, 1:10], method = 'euclidean') #Compute the Euclidean distance between each samples 
+str(distance)
+```
+
+    ##  'dist' num [1:3133756] 0.01155 0.01751 0.01546 0.00543 0.00935 ...
+    ##  - attr(*, "Size")= int 2504
+    ##  - attr(*, "Diag")= logi FALSE
+    ##  - attr(*, "Upper")= logi FALSE
+    ##  - attr(*, "method")= chr "euclidean"
+    ##  - attr(*, "call")= language dist(x = pca$eigenvect[, 1:10], method = "euclidean")
+
+then, compute hierarchical clustering using 4 different linkage types:
+complete, single, average and Wald, and plot them.
+
+``` r
+pr.hc.s <- hclust(distance, method = 'single')
+pr.hc.c <- hclust(distance, method = 'complete')
+pr.hc.a <- hclust(distance, method = 'average')
+pr.hc.w <- hclust(distance, method = 'ward.D')
+
+# plot them
+op <- par(mar = c(0,4,4,2), mfrow = c(2,2))
+
+plot(pr.hc.s, labels = FALSE, main = "Single")
+plot(pr.hc.c, labels = FALSE, main = "Complete")
+plot(pr.hc.a, labels = FALSE, main = "Average")
+plot(pr.hc.w, labels = FALSE, main = "Ward")
+```
+
+![](clustering-pca_files/figure-gfm/unnamed-chunk-18-1.png)<!-- -->
+
+``` r
+par(op)
+```
+
+Find the 5 clusters based on the Ward linkage method.
+
+``` r
+cluster_samples = cutree(pr.hc.w, k = 5)
+table(cluster_samples, geno$superpop)
+```
+
+    ##                
+    ## cluster_samples African East Asian European Latin American South Asian
+    ##               1       0          0      493            266         103
+    ##               2       0         14       10             79         386
+    ##               3       0        490        0              0           0
+    ##               4     207          0        0            134           0
+    ##               5     297          0        0             25           0
+
+Cluster 3 contains only the East Asian population, and cluster 5
+contains only the South Asian population. The other clusters contain the
+mixture. Let us look at the five clusters defined by the single linkage.
+
+``` r
+cluster_samples = cutree(pr.hc.s, k = 5)
+table(cluster_samples, geno$superpop)
+```
+
+    ##                
+    ## cluster_samples African East Asian European Latin American South Asian
+    ##               1     207        490      493            397         103
+    ##               2     297         14       10            104         386
+    ##               3       0          0        0              1           0
+    ##               4       0          0        0              1           0
+    ##               5       0          0        0              1           0
+
+The clustering based on the single linkage put most samples to the first
+cluster.
+
+``` r
+cluster_samples = cutree(pr.hc.a, k = 5) 
+table(cluster_samples, geno$superpop)
+```
+
+    ##                
+    ## cluster_samples African East Asian European Latin American South Asian
+    ##               1       0          0      491            137         102
+    ##               2       0        490        2            132           1
+    ##               3       0         14       10             79         386
+    ##               4     207          0        0            131           0
+    ##               5     297          0        0             25           0
+
+So is the average method. We can also visualize the genetic distribution
+with heatmap
+
+``` r
+# set pheatmap clustering parameters
+clust_dist_col = "euclidean" 
+clust_method = "ward.D"
+clust_scale = "none"
+
+## the annotation option uses the covariate object (pData(geo_obj)). It must have the same rownames, as the colnames in our data object (expr_scaled).  
+
+pheatmap(t(pca$eigenvect[,1:10]), 
+         cluster_rows = TRUE, 
+         cluster_cols = TRUE, 
+         scale = clust_scale, 
+         clustering_method = clust_method, 
+         clustering_distance_cols = clust_dist_col, 
+         show_colnames = FALSE, show_rownames = FALSE,  
+         main = "Clustering heatmap for top 10 principal components", 
+         annotation = t(geno$superpop))
+```
+
+![](clustering-pca_files/figure-gfm/unnamed-chunk-22-1.png)<!-- -->
+
+## K-mean clustering
+
+Keep in mind that k-means makes certain assumptions about the data that
+may not always hold:  
+- Variance of distribution of each variable is spherical  
+- All variables have the same variance  
+- A prior probability that all k clusters have the same number of
+members
+
+One can argue that for genetic data, the assumption that all SNPs have
+the same variance is the most easily violated.
+
+``` r
+set.seed(17)
+k <- 5
+pr.km <- kmeans(pca$eigenvect[, 1:10], centers = k, nstart =  50)
+
+#We can look at the size of each cluster
+pr.km$size
+```
+
+    ## [1] 713 739 504  99 449
+
+``` r
+table(pr.km$cluster, geno$superpop)
+```
+
+    ##    
+    ##     African East Asian European Latin American South Asian
+    ##   1       0          0      503            210           0
+    ##   2     112          0        0            138         489
+    ##   3       0        504        0              0           0
+    ##   4      99          0        0              0           0
+    ##   5     293          0        0            156           0
+
+K-means clustering successfully identifies the clusters of East Asian,
+European and South Asian populations.
+
+## PAM algorithm
+
+In K-medoids clustering, K representative objects (medoids) are chosen
+as cluster centers and objects are assigned to the center (medoid =
+cluster) with which they have minimum dissimilarity (Kaufman and
+Rousseeuw, 1990).  
+Nice features of partitioning around medoids (PAM) are: (a) it accepts a
+dissimilarity (distance) matrix (use `diss = TRUE`), (b) it is more
+robust to outliers as the centroids of the clusters are data objects,
+unlike k-means.
+
+Here we run PAM with k = 5.
+
+``` r
+pr.pam <- pam(distance, k = 5)
+table(pr.pam$clustering, geno$superpop)
+```
+
+    ##    
+    ##     African East Asian European Latin American South Asian
+    ##   1       0          0      488            173          66
+    ##   2       0        490        5             92          37
+    ##   3       0         14       10             76         386
+    ##   4     207          0        0            135           0
+    ##   5     297          0        0             28           0
+
+We will now determine the optimal number of clusters, by looking at the
+average silhouette value. This is a statistic introduced in the PAM
+algorithm, which lets us identify a suitable k.
+
+**The silhouette plot** The `cluster` package contains the function
+`silhouette()` that compares the minimum average dissimilarity
+(distance) of each object to other clusters **with** the average
+dissimilarity to objects in its own cluster. The resulting measure is
+called the “width of each object’s silhouette”. A value close to 1
+indicates that the object is similar to objects in its cluster compared
+to those in other clusters. Thus, the average of all objects silhouette
+widths gives an indication of how well the clusters are defined.
+
+``` r
+op <- par(mar = c(5,1,4,4))
+plot(pr.pam, main = "Silhouette Plot for 5 clusters")
+```
+
+![](clustering-pca_files/figure-gfm/unnamed-chunk-25-1.png)<!-- -->
+
+``` r
+par(op)
+```
+
+We see that cluster 5 is the best defined cluster, followed by cluster
+4. We now draw a plot showing number of clusters in the x-axis and
+average silhouette widths in the y-axis, and determine the optimal
+choice for the number of clusters.
+
+``` r
+j <- 2:30
+avg_width <- numeric(length(j))  # pre-allocate numeric vector
+distance <- dist(pca$eigenvect[, 1:10])
+
+for (i in j) {
+  pam_result <- pam(distance, k = i , diss = TRUE)  # ensure 'distance' is a dissimilarity matrix
+  avg_width[i - 1] <- pam_result$silinfo$avg.width
+}
+
+plot(j, avg_width, type = "b", pch = 19, col = "blue",
+     xlab = "Number of clusters (k)",
+     ylab = "Average silhouette width",
+     main = "Silhouette Width vs. Number of Clusters")
+```
+
+![](clustering-pca_files/figure-gfm/silplot-1.png)<!-- -->
+
+It seems like the optimal number is 10.
+
+# Discussion
+
+In this project, I utilized various dimensionality reduction methods to
+visualize genetic data. Principal Component Analysis (PCA) allows for
+the separation of samples based on their continental ancestry groups. I
+also reproduced the finding that the first principal component
+distinguishes between northern and southern geographical locations
+within the European population. Additionally, I identified that Latin
+Americans exhibit significantly greater genetic variance compared to
+other populations. Furthermore, I applied several clustering algorithms
+to compare their performance on the genetic data.
+
+# References
+
+<div id="refs" class="references csl-bib-body hanging-indent"
+entry-spacing="0">
+
+<div id="ref-novembre2008" class="csl-entry">
+
+Novembre, John, Toby Johnson, Katarzyna Bryc, Zoltán Kutalik, Adam R.
+Boyko, Adam Auton, Amit Indap, et al. 2008. “Genes Mirror Geography
+Within Europe.” *Nature* 456 (7218): 98–101.
+<https://doi.org/10.1038/nature07331>.
+
+</div>
+
+</div>
